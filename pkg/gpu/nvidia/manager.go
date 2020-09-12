@@ -45,6 +45,11 @@ var (
 	resourceName = "nvidia.com/gpu"
 )
 
+type GPUConfig struct {
+	// Number of equal-sized partitions to slice GPUs on this node.
+	GPUPartitionCount int
+}
+
 // nvidiaGPUManager manages nvidia gpu devices.
 type nvidiaGPUManager struct {
 	devDirectory   string
@@ -55,6 +60,7 @@ type nvidiaGPUManager struct {
 	socket         string
 	stop           chan bool
 	devicesMutex   sync.Mutex
+	gpuConfig      GPUConfig
 }
 
 type MountPath struct {
@@ -62,12 +68,13 @@ type MountPath struct {
 	ContainerPath string
 }
 
-func NewNvidiaGPUManager(devDirectory string, mountPaths []MountPath) *nvidiaGPUManager {
+func NewNvidiaGPUManager(devDirectory string, mountPaths []MountPath, gpuConfig GPUConfig) *nvidiaGPUManager {
 	return &nvidiaGPUManager{
 		devDirectory: devDirectory,
 		mountPaths:   mountPaths,
 		devices:      make(map[string]pluginapi.Device),
 		stop:         make(chan bool),
+		gpuConfig:    gpuConfig,
 	}
 }
 

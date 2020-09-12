@@ -15,8 +15,10 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"time"
 
 	gpumanager "github.com/GoogleCloudPlatform/container-engine-accelerators/pkg/gpu/nvidia"
@@ -36,7 +38,23 @@ var (
 	hostVulkanICDPathPrefix      = flag.String("host-vulkan-icd-path", "/home/kubernetes/bin/nvidia/vulkan/icd.d", "Path on the host that contains the Nvidia Vulkan installable client driver. This will be mounted inside the container as '-container-vulkan-icd-path'")
 	containerVulkanICDPathPrefix = flag.String("container-vulkan-icd-path", "/etc/vulkan/icd.d", "Path on the container that mounts '-host-vulkan-icd-path'")
 	pluginMountPath              = flag.String("plugin-directory", "/device-plugin", "The directory path to create plugin socket")
+	gpuConfigFile                = flag.String("gpu-config", "/etc/nvidia/gpu_config.json", "File with GPU configurations for device plugin")
 )
+
+func parseGPUConfig(gpuConfigFile string) (gpumanager.GPUConfig, error) {
+	var gpuConfig gpumanager.GPUConfig
+
+	gpuConfigContent, err := ioutil.ReadFile(gpuConfigFile)
+	if err != nil {
+		return gpuConfig, fmt.Errorf("unable to read gpu config file %s: %v", gpuConfigFile, err)
+	}
+
+	err = json.Unmarshal(gpuConfigContent, &gpuConfig)
+	if err != nil {
+		return gpuConfig, fmt.Errorf("failed to parse GPU config file contents: %s, error: %v", gpuConfigContent, err)
+	}
+	return gpuConfig, nil
+}
 
 func main() {
 	flag.Parse()
@@ -44,7 +62,18 @@ func main() {
 	mountPaths := []gpumanager.MountPath{
 		{HostPath: *hostPathPrefix, ContainerPath: *containerPathPrefix},
 		{HostPath: *hostVulkanICDPathPrefix, ContainerPath: *containerVulkanICDPathPrefix}}
-	ngm := gpumanager.NewNvidiaGPUManager(devDirectory, mountPaths)
+
+	gpuConfig, err := parseGPUConfig(*gpuConfigFile)
+	if err != nil {
+		glog.Infof("Failed to parse GPU config file %s: %v", *gpuConfigFile, err)
+		glog.Infoln("Using default GPU config")
+		gpuConfig = gpumanager.GPUConfig{
+			GPUPartitionCount: 0,
+		}
+	}
+	glog.Infof("Using GPU config: %+v", gpuConfig)
+
+	ngm := gpumanager.NewNvidiaGPUManager(devDirectory, mountPaths, gpuConfig)
 	// Keep on trying until success. This is required
 	// because Nvidia drivers may not be installed initially.
 	for {

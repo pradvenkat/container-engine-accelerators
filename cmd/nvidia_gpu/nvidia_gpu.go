@@ -30,6 +30,7 @@ const (
 	kubeletEndpoint      = "kubelet.sock"
 	pluginEndpointPrefix = "nvidiaGPU"
 	devDirectory         = "/dev"
+	procDirectory        = "/proc"
 )
 
 var (
@@ -73,7 +74,7 @@ func main() {
 	}
 	glog.Infof("Using GPU config: %+v", gpuConfig)
 
-	ngm := gpumanager.NewNvidiaGPUManager(devDirectory, mountPaths, gpuConfig)
+	ngm := gpumanager.NewNvidiaGPUManager(devDirectory, procDirectory, mountPaths, gpuConfig)
 	// Keep on trying until success. This is required
 	// because Nvidia drivers may not be installed initially.
 	for {

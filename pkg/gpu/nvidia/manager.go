@@ -15,6 +15,7 @@
 package nvidia
 
 import (
+	"fmt"
 	"io/ioutil"
 	"net"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GoogleCloudPlatform/container-engine-accelerators/pkg/gpu/nvidia/mig"
 	"github.com/golang/glog"
 	"google.golang.org/grpc"
 
@@ -39,6 +41,7 @@ const (
 	nvidiaDeviceRE            = `^nvidia[0-9]*$`
 	gpuCheckInterval          = 10 * time.Second
 	pluginSocketCheckInterval = 1 * time.Second
+	nvidiaSmiPath             = "/usr/local/nvidia/bin/nvidia-smi"
 )
 
 var (
@@ -52,15 +55,16 @@ type GPUConfig struct {
 
 // nvidiaGPUManager manages nvidia gpu devices.
 type nvidiaGPUManager struct {
-	devDirectory   string
-	mountPaths     []MountPath
-	defaultDevices []string
-	devices        map[string]pluginapi.Device
-	grpcServer     *grpc.Server
-	socket         string
-	stop           chan bool
-	devicesMutex   sync.Mutex
-	gpuConfig      GPUConfig
+	devDirectory     string
+	mountPaths       []MountPath
+	defaultDevices   []string
+	devices          map[string]pluginapi.Device
+	grpcServer       *grpc.Server
+	socket           string
+	stop             chan bool
+	devicesMutex     sync.Mutex
+	gpuConfig        GPUConfig
+	migDeviceManager *mig.DeviceManager
 }
 
 type MountPath struct {
@@ -68,13 +72,14 @@ type MountPath struct {
 	ContainerPath string
 }
 
-func NewNvidiaGPUManager(devDirectory string, mountPaths []MountPath, gpuConfig GPUConfig) *nvidiaGPUManager {
+func NewNvidiaGPUManager(devDirectory, procDirectory string, mountPaths []MountPath, gpuConfig GPUConfig) *nvidiaGPUManager {
 	return &nvidiaGPUManager{
-		devDirectory: devDirectory,
-		mountPaths:   mountPaths,
-		devices:      make(map[string]pluginapi.Device),
-		stop:         make(chan bool),
-		gpuConfig:    gpuConfig,
+		devDirectory:     devDirectory,
+		mountPaths:       mountPaths,
+		devices:          make(map[string]pluginapi.Device),
+		stop:             make(chan bool),
+		gpuConfig:        gpuConfig,
+		migDeviceManager: mig.NewDeviceManager(devDirectory, procDirectory, nvidiaSmiPath),
 	}
 }
 
@@ -142,6 +147,41 @@ func (ngm *nvidiaGPUManager) GetDeviceState(DeviceName string) string {
 	return pluginapi.Healthy
 }
 
+func (ngm *nvidiaGPUManager) configureGPUPartitions() error {
+	if ngm.gpuConfig.GPUPartitionCount <= 0 {
+		return nil
+	}
+
+	migModeEnabled, err := ngm.migDeviceManager.CurrentMigMode()
+	if err != nil {
+		return fmt.Errorf("Unable to check if mig mode is currently enabled: %v", err)
+	}
+
+	if !migModeEnabled {
+		glog.Infoln("Mig mode is not enabled currently. Enabling mig mode")
+		err := ngm.migDeviceManager.EnableMigMode()
+		if err != nil {
+			return fmt.Errorf("unable to enable mig mode: %v", err)
+		}
+
+		// VM reboot is necessary for MIG mode change to take effect
+		err = ngm.rebootNode()
+		if err != nil {
+			return fmt.Errorf("unable to restart node to enable mig mode: %v", err)
+		}
+
+		// Node should be rebooting at this point. Return error, since we cannot proceed until mig changes take effect.
+		return fmt.Errorf("node needs to be rebooted to enable Mig modede")
+	}
+
+	glog.Infoln("Mig mode is enabled, proceeding to create GPU instances")
+	return ngm.migDeviceManager.CreateGPUInstances(ngm.gpuConfig.GPUPartitionCount)
+}
+
+func (ngm *nvidiaGPUManager) rebootNode() error {
+	return ioutil.WriteFile("/proc/sysrq-trigger", []byte("b"), 0644)
+}
+
 // Discovers Nvidia GPU devices and sets up device access environment.
 func (ngm *nvidiaGPUManager) Start() error {
 	nvidiaCtlDevicePath := path.Join(ngm.devDirectory, nvidiaCtlDevice)
@@ -159,6 +199,10 @@ func (ngm *nvidiaGPUManager) Start() error {
 	nvidiaUVMToolsDevicePath := path.Join(ngm.devDirectory, nvidiaUVMToolsDevice)
 	if _, err := os.Stat(nvidiaUVMToolsDevicePath); err == nil {
 		ngm.defaultDevices = append(ngm.defaultDevices, nvidiaUVMToolsDevicePath)
+	}
+
+	if err := ngm.configureGPUPartitions(); err != nil {
+		return fmt.Errorf("Failed to configure GPU partitions: %v", err)
 	}
 
 	if err := ngm.discoverGPUs(); err != nil {

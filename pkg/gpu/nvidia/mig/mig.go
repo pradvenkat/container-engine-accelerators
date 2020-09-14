@@ -16,8 +16,18 @@ package mig
 
 import (
 	"fmt"
+	"io/ioutil"
+	"os"
 	"os/exec"
+	"path"
+	"regexp"
 	"strings"
+
+	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1beta1"
+)
+
+const (
+	nvidiaCapDir = "/proc/driver/nvidia/capabilities"
 )
 
 // DeviceManager performs various management operations on mig devices.
@@ -58,21 +68,114 @@ func (d *DeviceManager) EnableMigMode() error {
 
 // CreateGPUInstances partitions each GPU on the node into `gpuPartitionCount` equal sized GPU instances.
 func (d *DeviceManager) CreateGPUInstances(gpuPartitionCount int) error {
+	if err := d.DestroyAllGPUInstance(); err != nil {
+		return fmt.Errorf("unable to destroy GPU instances: %v", err)
+	}
+
 	p, err := BuildPartitionStr(gpuPartitionCount)
 	if err != nil {
 		return err
 	}
-	err = exec.Command(d.nvidiaSmiPath, "mig", "-cgi", p).Run()
+	out, err := exec.Command(d.nvidiaSmiPath, "mig", "-cgi", p).Output()
 	if err != nil {
-		return fmt.Errorf("failed to create GPU Instances: %v", err)
+		return fmt.Errorf("failed to create GPU Instances: output: %s, error: %v", out, err)
 	}
 
-	err = exec.Command(d.nvidiaSmiPath, "mig", "-cci").Run()
+	out, err = exec.Command(d.nvidiaSmiPath, "mig", "-cci").Output()
 	if err != nil {
-		return fmt.Errorf("failed to create compute instances: %s", err)
+		return fmt.Errorf("failed to create compute instances: output: %s, error: %v", out, err)
 	}
 
 	return nil
+}
+
+// DestroyAllGPUInstance destroys all compute and GPU instances on the node
+func (d *DeviceManager) DestroyAllGPUInstance() error {
+	out, err := exec.Command(d.nvidiaSmiPath, "mig", "-dci").Output()
+	if err != nil {
+		return fmt.Errorf("unable to destroy compute instance, output: %serror: %v ", out, err)
+	}
+
+	out, err = exec.Command(d.nvidiaSmiPath, "mig", "-dgi").Output()
+	if err != nil {
+		return fmt.Errorf("unable to destroy gpu instance, output: %serror: %v ", out, err)
+	}
+	return nil
+}
+
+// DiscoverGPUInstance finds all the GPU instances on the node, and returns a list of DeviceSpec for each GPU instance
+// that provide access to the GPU Instance.
+func (d *DeviceManager) DiscoverGPUInstance() (map[string][]pluginapi.DeviceSpec, error) {
+	ret := make(map[string][]pluginapi.DeviceSpec)
+	capFiles, err := ioutil.ReadDir(nvidiaCapDir)
+	if err != nil {
+		return ret, fmt.Errorf("failed to read capabilities directory: %v", err)
+	}
+
+	gpuFileRegexp := regexp.MustCompile("gpu([0-9]+)")
+	giFileRegexp := regexp.MustCompile("gi([0-9]+)")
+	deviceRegexp := regexp.MustCompile("DeviceFileMinor: ([0-9]+)")
+	for _, capFile := range capFiles {
+		m := gpuFileRegexp.FindStringSubmatch(capFile.Name())
+		if len(m) != 2 {
+			// Not a gpu, continue to next file
+			continue
+		}
+
+		gpuID := m[1]
+
+		giBasePath := path.Join(nvidiaCapDir, capFile.Name(), "mig")
+		giFiles, err := ioutil.ReadDir(giBasePath)
+		if err != nil {
+			return ret, fmt.Errorf("unable to discover gpu instance: %v", err)
+		}
+
+		for _, giFile := range giFiles {
+			if !giFileRegexp.MatchString(giFile.Name()) {
+				continue
+			}
+
+			gpuInstanceID := "nvidia" + gpuID + "/" + giFile.Name()
+
+			giAccessFile := path.Join(giBasePath, giFile.Name(), "access")
+			content, err := ioutil.ReadFile(giAccessFile)
+			if err != nil {
+				return ret, fmt.Errorf("unable to read GPU Instance access file (%s): %v", giAccessFile, err)
+			}
+
+			m := deviceRegexp.FindStringSubmatch(string(content))
+			if len(m) != 2 {
+				return ret, fmt.Errorf("unexpected contents in GPU instance access file(%s): %v", giAccessFile, err)
+			}
+			minorDevice := m[1]
+
+			gpuDevice := path.Join(d.devDirectory, "nvidia"+gpuID)
+			if _, err := os.Stat(gpuDevice); err != nil {
+				return ret, fmt.Errorf("GPU device (%s) not fount: %v", gpuDevice, err)
+			}
+
+			gpuInstanceDevice := path.Join(d.devDirectory, "nvidia-caps", "nvidia-cap"+minorDevice)
+			if _, err := os.Stat(gpuInstanceDevice); err != nil {
+				return ret, fmt.Errorf("GPU instance device (%s) not fount: %v", gpuInstanceDevice, err)
+			}
+
+			ret[gpuInstanceID] = []pluginapi.DeviceSpec{
+				{
+					ContainerPath: gpuDevice,
+					HostPath:      gpuDevice,
+					Permissions:   "mrw",
+				},
+				{
+					ContainerPath: gpuInstanceDevice,
+					HostPath:      gpuInstanceDevice,
+					Permissions:   "mrw",
+				},
+			}
+
+		}
+	}
+
+	return ret, nil
 }
 
 // BuildPartitionStr builds a string that represents a partitioning a GPU into `gpuPartitionCount` equal sized GPU instances.

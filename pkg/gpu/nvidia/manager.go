@@ -42,6 +42,7 @@ const (
 	gpuCheckInterval          = 10 * time.Second
 	pluginSocketCheckInterval = 1 * time.Second
 	nvidiaSmiPath             = "/usr/local/nvidia/bin/nvidia-smi"
+	nvidiaCapDir              = "/proc/driver/nvidia/capabilities"
 )
 
 var (
@@ -55,16 +56,17 @@ type GPUConfig struct {
 
 // nvidiaGPUManager manages nvidia gpu devices.
 type nvidiaGPUManager struct {
-	devDirectory     string
-	mountPaths       []MountPath
-	defaultDevices   []string
-	devices          map[string]pluginapi.Device
-	grpcServer       *grpc.Server
-	socket           string
-	stop             chan bool
-	devicesMutex     sync.Mutex
-	gpuConfig        GPUConfig
-	migDeviceManager *mig.DeviceManager
+	devDirectory           string
+	mountPaths             []MountPath
+	defaultDevices         []string
+	devices                map[string]pluginapi.Device
+	grpcServer             *grpc.Server
+	socket                 string
+	stop                   chan bool
+	devicesMutex           sync.Mutex
+	gpuConfig              GPUConfig
+	migDeviceManager       *mig.DeviceManager
+	gpuInstanceDeviceSpecs map[string][]pluginapi.DeviceSpec
 }
 
 type MountPath struct {
@@ -182,6 +184,24 @@ func (ngm *nvidiaGPUManager) rebootNode() error {
 	return ioutil.WriteFile("/proc/sysrq-trigger", []byte("b"), 0644)
 }
 
+func (ngm *nvidiaGPUManager) discoverGPUInstances() error {
+
+	gpuInstances, err := ngm.migDeviceManager.DiscoverGPUInstance()
+	if err != nil {
+		return err
+	}
+	ngm.gpuInstanceDeviceSpecs = gpuInstances
+
+	for deviceID := range ngm.gpuInstanceDeviceSpecs {
+		ngm.devices[deviceID] = pluginapi.Device{
+			ID:     deviceID,
+			Health: pluginapi.Healthy,
+		}
+	}
+
+	return nil
+}
+
 // Discovers Nvidia GPU devices and sets up device access environment.
 func (ngm *nvidiaGPUManager) Start() error {
 	nvidiaCtlDevicePath := path.Join(ngm.devDirectory, nvidiaCtlDevice)
@@ -202,11 +222,17 @@ func (ngm *nvidiaGPUManager) Start() error {
 	}
 
 	if err := ngm.configureGPUPartitions(); err != nil {
-		return fmt.Errorf("Failed to configure GPU partitions: %v", err)
+		return fmt.Errorf("failed to configure GPU partitions: %v", err)
 	}
 
-	if err := ngm.discoverGPUs(); err != nil {
-		return err
+	if ngm.gpuConfig.GPUPartitionCount > 0 {
+		if err := ngm.discoverGPUInstances(); err != nil {
+			return fmt.Errorf("unable to discover GPU instances: %v", err)
+		}
+	} else {
+		if err := ngm.discoverGPUs(); err != nil {
+			return err
+		}
 	}
 
 	return nil

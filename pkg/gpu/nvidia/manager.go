@@ -253,6 +253,36 @@ func (ngm *nvidiaGPUManager) CheckDeviceStates() bool {
 	return changed
 }
 
+func (ngm *nvidiaGPUManager) DeviceSpecsFromID(deviceID string) ([]pluginapi.DeviceSpec, error) {
+	dev, ok := ngm.devices[deviceID]
+	if !ok {
+		return nil, fmt.Errorf("invalid allocation request with non-existing device %s", deviceID)
+	}
+	if dev.Health != pluginapi.Healthy {
+		return nil, fmt.Errorf("invalid allocation request with unhealthy device %s", deviceID)
+	}
+
+	deviceSpecs := make([]pluginapi.DeviceSpec, 0)
+	if ngm.gpuConfig.GPUPartitionCount > 0 {
+		giDevices, ok := ngm.gpuInstanceDeviceSpecs[deviceID]
+		if !ok {
+			return nil, fmt.Errorf("invalid allocation request with non-existing GPU instance %s", deviceID)
+		}
+
+		for id := range giDevices {
+			deviceSpecs = append(deviceSpecs, giDevices[id])
+		}
+	} else {
+		deviceSpecs = append(deviceSpecs, pluginapi.DeviceSpec{
+			HostPath:      path.Join(ngm.devDirectory, deviceID),
+			ContainerPath: path.Join(ngm.devDirectory, deviceID),
+			Permissions:   "mrw",
+		})
+	}
+
+	return deviceSpecs, nil
+}
+
 func (ngm *nvidiaGPUManager) Serve(pMountPath, kEndpoint, pluginEndpoint string) {
 	registerWithKubelet := false
 	if _, err := os.Stat(path.Join(pMountPath, kEndpoint)); err == nil {

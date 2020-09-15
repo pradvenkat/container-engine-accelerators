@@ -17,7 +17,6 @@ package nvidia
 import (
 	"fmt"
 	"net"
-	"path"
 	"time"
 
 	"github.com/golang/glog"
@@ -62,18 +61,14 @@ func (s *pluginServiceV1Beta1) Allocate(ctx context.Context, requests *pluginapi
 		resp := new(pluginapi.ContainerAllocateResponse)
 		// Add all requested devices to Allocate Response
 		for _, id := range rqt.DevicesIDs {
-			dev, ok := s.ngm.devices[id]
-			if !ok {
-				return nil, fmt.Errorf("invalid allocation request with non-existing device %s", id)
+			devices, err := s.ngm.DeviceSpecsFromID(id)
+			if err != nil {
+				return nil, err
 			}
-			if dev.Health != pluginapi.Healthy {
-				return nil, fmt.Errorf("invalid allocation request with unhealthy device %s", id)
+
+			for id := range devices {
+				resp.Devices = append(resp.Devices, &devices[id])
 			}
-			resp.Devices = append(resp.Devices, &pluginapi.DeviceSpec{
-				HostPath:      path.Join(s.ngm.devDirectory, id),
-				ContainerPath: path.Join(s.ngm.devDirectory, id),
-				Permissions:   "mrw",
-			})
 		}
 		// Add all default devices to Allocate Response
 		for _, d := range s.ngm.defaultDevices {
@@ -93,6 +88,7 @@ func (s *pluginServiceV1Beta1) Allocate(ctx context.Context, requests *pluginapi
 		}
 		resps.ContainerResponses = append(resps.ContainerResponses, resp)
 	}
+	glog.Infof(" --- pradvenkat: allocate response: %v", resps)
 	return resps, nil
 }
 

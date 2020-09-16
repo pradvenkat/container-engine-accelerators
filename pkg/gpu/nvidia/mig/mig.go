@@ -93,6 +93,9 @@ func (d *DeviceManager) CreateGPUInstances(gpuPartitionCount int) error {
 func (d *DeviceManager) DestroyAllGPUInstance() error {
 	out, err := exec.Command(d.nvidiaSmiPath, "mig", "-dci").Output()
 	if err != nil {
+		if strings.Contains(err.Error(), "No GPU instances found") {
+			return nil
+		}
 		return fmt.Errorf("unable to destroy compute instance, output: %serror: %v ", out, err)
 	}
 
@@ -147,16 +150,33 @@ func (d *DeviceManager) DiscoverGPUInstance() (map[string][]pluginapi.DeviceSpec
 			if len(m) != 2 {
 				return ret, fmt.Errorf("unexpected contents in GPU instance access file(%s): %v", giAccessFile, err)
 			}
-			minorDevice := m[1]
+			giMinorDevice := m[1]
+
+			ciAccessFile := path.Join(giBasePath, giFile.Name(), "ci0", "access")
+			content, err = ioutil.ReadFile(ciAccessFile)
+			if err != nil {
+				return ret, fmt.Errorf("unable to read Compute Instance access file (%s): %v", ciAccessFile, err)
+			}
+
+			m = deviceRegexp.FindStringSubmatch(string(content))
+			if len(m) != 2 {
+				return ret, fmt.Errorf("unexpected contents in compute instance access file(%s): %v", ciAccessFile, err)
+			}
+			ciMinorDevice := m[1]
 
 			gpuDevice := path.Join(d.devDirectory, "nvidia"+gpuID)
 			if _, err := os.Stat(gpuDevice); err != nil {
 				return ret, fmt.Errorf("GPU device (%s) not fount: %v", gpuDevice, err)
 			}
 
-			gpuInstanceDevice := path.Join(d.devDirectory, "nvidia-caps", "nvidia-cap"+minorDevice)
-			if _, err := os.Stat(gpuInstanceDevice); err != nil {
-				return ret, fmt.Errorf("GPU instance device (%s) not fount: %v", gpuInstanceDevice, err)
+			giDevice := path.Join(d.devDirectory, "nvidia-caps", "nvidia-cap"+giMinorDevice)
+			if _, err := os.Stat(giDevice); err != nil {
+				return ret, fmt.Errorf("GPU instance device (%s) not fount: %v", giDevice, err)
+			}
+
+			ciDevice := path.Join(d.devDirectory, "nvidia-caps", "nvidia-cap"+ciMinorDevice)
+			if _, err := os.Stat(ciDevice); err != nil {
+				return ret, fmt.Errorf("GPU instance device (%s) not fount: %v", ciDevice, err)
 			}
 
 			ret[gpuInstanceID] = []pluginapi.DeviceSpec{
@@ -166,8 +186,13 @@ func (d *DeviceManager) DiscoverGPUInstance() (map[string][]pluginapi.DeviceSpec
 					Permissions:   "mrw",
 				},
 				{
-					ContainerPath: gpuInstanceDevice,
-					HostPath:      gpuInstanceDevice,
+					ContainerPath: giDevice,
+					HostPath:      giDevice,
+					Permissions:   "mrw",
+				},
+				{
+					ContainerPath: ciDevice,
+					HostPath:      ciDevice,
 					Permissions:   "mrw",
 				},
 			}

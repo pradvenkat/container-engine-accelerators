@@ -84,6 +84,8 @@ func (s *pluginServiceV1Beta1) Allocate(ctx context.Context, requests *pluginapi
 		}
 		resps.ContainerResponses = append(resps.ContainerResponses, resp)
 	}
+	// TODO: remove after testing
+	glog.Infof("Allocate response: %v", resps)
 	return resps, nil
 }
 

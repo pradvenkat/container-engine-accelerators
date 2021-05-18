@@ -21,6 +21,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"strconv"
 	"sync"
 	"time"
 
@@ -46,12 +47,14 @@ const (
 )
 
 var (
-	resourceName = "nvidia.com/gpu"
+	gpuResourceName  = "nvidia.com/gpu"
+	vgpuResourceName = "cloud.google.com/vgpu"
 )
 
 // GPUConfig stores the settings used to configure the GPUs on a node.
 type GPUConfig struct {
 	GPUPartitionSize string
+	VGPUCountPerGPU  int
 }
 
 // nvidiaGPUManager manages nvidia gpu devices.
@@ -76,9 +79,20 @@ type MountPath struct {
 	ContainerPath string
 }
 
-func NewNvidiaGPUManager(devDirectory string, mountPaths []MountPath, gpuConfig GPUConfig) *nvidiaGPUManager {
-	return &nvidiaGPUManager{
+func validateGPUConfig(gpuConfig GPUConfig) error {
+	if gpuConfig.GPUPartitionSize != "" && gpuConfig.VGPUCountPerGPU > 0 {
+		return fmt.Errorf("vGPUs and MIG partitions are not supported together at this time")
+	}
 
+	return nil
+}
+func NewNvidiaGPUManager(devDirectory string, mountPaths []MountPath, gpuConfig GPUConfig) *nvidiaGPUManager {
+	if err := validateGPUConfig(gpuConfig); err != nil {
+		// TODO: change the return type to include error
+		return nil
+	}
+
+	return &nvidiaGPUManager{
 		devDirectory:        devDirectory,
 		mountPaths:          mountPaths,
 		devices:             make(map[string]pluginapi.Device),
@@ -94,15 +108,55 @@ func NewNvidiaGPUManager(devDirectory string, mountPaths []MountPath, gpuConfig 
 // ListDevices lists all GPU devices (including partitions) available on this node.
 func (ngm *nvidiaGPUManager) ListDevices() map[string]pluginapi.Device {
 	if ngm.gpuConfig.GPUPartitionSize == "" {
-		return ngm.devices
+		if ngm.gpuConfig.VGPUCountPerGPU > 0 {
+			vgpuCount := len(ngm.devices) * ngm.gpuConfig.VGPUCountPerGPU
+			devices := make(map[string]pluginapi.Device, vgpuCount)
+
+			for i := 0; i < vgpuCount; i++ {
+				deviceID := fmt.Sprintf("vgpu%d", i)
+				devices[deviceID] = pluginapi.Device{
+					ID:     deviceID,
+					Health: pluginapi.Healthy,
+				}
+			}
+
+			glog.Infof("vGPU devices disovered: %v", devices)
+			return devices
+		} else {
+			return ngm.devices
+		}
 	}
 
 	return ngm.migDeviceManager.ListGPUPartitionDevices()
 }
 
+func (ngm *nvidiaGPUManager) virtualToPhysicalDeviceID(deviceID string) (string, error) {
+	vgpuRegex := regexp.MustCompile("vgpu([0-9]+)$")
+	m := vgpuRegex.FindStringSubmatch(deviceID)
+	if len(m) != 2 {
+		return "", fmt.Errorf("device ID (%s) is not a valid vGPU", deviceID)
+	}
+
+	vgpuID, err := strconv.Atoi(m[1])
+	if err != nil {
+		return "", fmt.Errorf("device ID (%s) is not a valid vGPU: %v", deviceID, err)
+	}
+
+	// TODO: check that physical GPU ID does not exceed # of GPUs on the node
+	return fmt.Sprintf("nvidia%d", vgpuID/ngm.gpuConfig.VGPUCountPerGPU), nil
+}
+
 // DeviceSpec returns the device spec that inclues list of devices to allocate for a deviceID.
 func (ngm *nvidiaGPUManager) DeviceSpec(deviceID string) ([]pluginapi.DeviceSpec, error) {
 	if ngm.gpuConfig.GPUPartitionSize == "" {
+		if ngm.gpuConfig.VGPUCountPerGPU > 0 {
+			var err error
+			deviceID, err = ngm.virtualToPhysicalDeviceID(deviceID)
+			if err != nil {
+				return nil, err
+			}
+		}
+
 		deviceSpecs := make([]pluginapi.DeviceSpec, 0)
 		dev, ok := ngm.devices[deviceID]
 		if !ok {
@@ -272,6 +326,10 @@ func (ngm *nvidiaGPUManager) Serve(pMountPath, kEndpoint, pluginEndpoint string)
 					}
 					glog.Infoln("device-plugin server started serving")
 					// Registers with Kubelet.
+					resourceName := gpuResourceName
+					if ngm.gpuConfig.VGPUCountPerGPU > 0 {
+						resourceName = vgpuResourceName
+					}
 					err = RegisterWithKubelet(path.Join(pMountPath, kEndpoint), pluginEndpoint, resourceName)
 					if err != nil {
 						glog.Infoln("falling back to v1beta1 API")
